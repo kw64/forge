@@ -1,0 +1,9 @@
+[package]
+name = "ff-image"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MediaForge — traitement d'images par lots (redimensionnement, conversion, politique d'écrasement)"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "tiff", "gif"] }

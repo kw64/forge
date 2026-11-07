@@ -1,0 +1,13 @@
+[package]
+name = "ff-chip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rendu audio (WAV) des musiques rétro : YM/SNDH (Atari ST) et SID (Commodore 64). Les modules Amiga/PC passent par FFmpeg (libopenmpt)."
+
+[dependencies]
+ym2149-ym-replayer = "0.9"
+ym2149-sndh-replayer = { path = "../../vendor/ym2149-sndh-replayer" }
+ym2149-common = "0.9"
+resid-rs = "1.1"
+mos6502 = "0.10"

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=MediaForge
+Comment=Convertisseur de médias par lots
+Exec=mediaforge %F
+Icon=mediaforge
+Terminal=false
+Categories=AudioVideo;Video;Audio;
+MimeType=video/mp4;video/x-matroska;video/webm;video/quicktime;video/x-msvideo;audio/mpeg;audio/flac;audio/x-wav;audio/ogg;audio/aac;

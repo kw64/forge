@@ -1,0 +1,11 @@
+[package]
+name = "ff-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ff-core.workspace = true
+ff-probe.workspace = true
+ff-chip.workspace = true

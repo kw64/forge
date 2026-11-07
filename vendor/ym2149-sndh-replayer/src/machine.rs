@@ -1,0 +1,905 @@
+//! Atari ST machine emulation for SNDH playback.
+//!
+//! This module provides a minimal Atari ST emulation environment suitable
+//! for running SNDH music drivers. It includes:
+//!
+//! - 4MB RAM
+//! - Motorola 68000 CPU (configurable backend via features)
+//! - YM2149 sound chip (via ym2149 crate)
+//! - MFP 68901 timers (for SID voice and effects)
+//! - STE DAC (DMA audio)
+//! - LMC1992 audio mixer/filter (bass, treble, volume control)
+//!
+//! Memory map:
+//! - 0x000000 - 0x3FFFFF: RAM (4MB)
+//! - 0xFF8800 - 0xFF88FF: YM2149 PSG
+//! - 0xFF8900 - 0xFF8921: STE DAC (DMA audio)
+//! - 0xFF8922 - 0xFF8925: LMC1992 Microwire interface
+//! - 0xFFFA00 - 0xFFFA25: MFP 68901
+
+use crate::cpu_backend::{Cpu68k, CpuMemory, DefaultCpu};
+use crate::error::{Result, SndhError};
+use crate::lmc1992::Lmc1992;
+use crate::mfp68901::{Mfp68901, TimerId};
+use crate::ste_dac::SteDac;
+use ym2149::Ym2149;
+use ym2149_common::MASTER_GAIN;
+
+/// Map timer index to TimerId for interrupt acknowledgment.
+const TIMER_ID_MAP: [TimerId; 5] = [
+    TimerId::TimerA,
+    TimerId::TimerB,
+    TimerId::TimerC,
+    TimerId::TimerD,
+    TimerId::Gpi7,
+];
+
+/// RAM size (4 MB)
+const RAM_SIZE: usize = 4 * 1024 * 1024;
+
+// Memory-mapped hardware address ranges
+const YM2149_START: u32 = 0xFF8800;
+const YM2149_END: u32 = 0xFF8900;
+const STE_DAC_START: u32 = 0xFF8900;
+const STE_DAC_END: u32 = 0xFF8922;
+const LMC1992_START: u32 = 0xFF8922;
+const LMC1992_END: u32 = 0xFF8926;
+const MFP_START: u32 = 0xFFFA00;
+const MFP_END: u32 = 0xFFFA26;
+const MFP_WRITE_END: u32 = 0xFFFB00;
+
+/// Address for RTE instruction (to return from interrupts)
+const RTE_INSTRUCTION_ADDR: u32 = 0x500;
+
+/// Address for RESET instruction (to detect routine completion)
+const RESET_INSTRUCTION_ADDR: u32 = 0x502;
+
+/// SNDH upload address (must be above 64KB for some drivers)
+const SNDH_UPLOAD_ADDR: u32 = 0x10002;
+
+/// GEMDOS malloc emulation buffer start
+const GEMDOS_MALLOC_START: u32 = RAM_SIZE as u32 - 0x100000;
+
+/// Maximum frames to wait for init/interrupt routines to return before bailing.
+const INIT_TIMEOUT_FRAMES: u32 = 500;
+
+/// Interrupt vector addresses for MFP timers
+const IVECTOR: [u32; 5] = [0x134, 0x120, 0x114, 0x110, 0x13C];
+
+/// MFP interrupt priorities (directly from MFP register bit positions).
+/// Higher value = higher priority. Used for nested interrupt decisions.
+/// GPI7=15, TimerA=13, TimerB=8, TimerC=5, TimerD=4
+const MFP_PRIORITY: [u8; 5] = [13, 8, 5, 4, 15];
+
+/// Maximum interrupt nesting depth to prevent stack overflow.
+const MAX_INTERRUPT_NESTING: u8 = 4;
+
+/// MC68000 Exception Processing Cycles (from MC68000 User Manual, Table 8-14)
+/// These are the cycles consumed by exception entry before the handler runs.
+const CYCLES_INTERRUPT: u64 = 44;  // Interrupt acknowledgment + stack frame
+const CYCLES_TRAP: u64 = 34;       // TRAP instruction exception processing
+
+/// MFP-internal interrupt latency (timer fire to IPL assertion).
+/// This is the delay inside the MFP chip before the interrupt signal
+/// reaches the CPU's IPL lines. The additional CPU-side latency
+/// (completing current instruction) is implicitly modeled by only
+/// checking for interrupts after each instruction completes.
+///
+/// MFP internal: ~8-12 cycles for synchronization and priority encoding.
+/// We use 10 as a typical value.
+const MFP_INTERRUPT_LATENCY_CYCLES: u64 = 10;
+
+struct XbiosTimerConfig {
+    ctrl_port: u8,
+    data_port: u8,
+    enable_port: u8,
+    bit: u8,
+    mask: u8,
+    ctrl_value: u8,
+    data_value: u8,
+}
+
+/// Memory and peripheral subsystem (separate from CPU to avoid borrow issues).
+pub(crate) struct AtariMemory {
+    /// RAM (4MB)
+    pub(crate) ram: Vec<u8>,
+    /// YM2149 sound chip
+    pub(crate) ym2149: Ym2149,
+    /// MFP 68901 timer chip
+    pub(crate) mfp: Mfp68901,
+    /// STE DAC (DMA audio)
+    pub(crate) ste_dac: SteDac,
+    /// LMC1992 STE audio mixer/filter
+    pub(crate) lmc1992: Lmc1992,
+    /// Next GEMDOS malloc address
+    next_malloc_addr: u32,
+    /// Reset instruction executed flag
+    pub(crate) reset_triggered: bool,
+    /// Host sample rate
+    host_rate: u32,
+    /// Current CPU cycle count (for cycle-accurate YM2149 timing)
+    pub(crate) cpu_cycles: u64,
+}
+
+impl AtariMemory {
+    fn new(sample_rate: u32) -> Self {
+        Self {
+            ram: vec![0; RAM_SIZE],
+            ym2149: Ym2149::with_clocks(2_000_000, sample_rate),
+            mfp: Mfp68901::new(sample_rate),
+            ste_dac: SteDac::new(sample_rate),
+            lmc1992: Lmc1992::new(sample_rate),
+            next_malloc_addr: GEMDOS_MALLOC_START,
+            reset_triggered: false,
+            host_rate: sample_rate,
+            cpu_cycles: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.ram.fill(0);
+        self.ym2149.reset();
+        self.mfp.reset();
+        self.ste_dac.reset(self.host_rate);
+        self.lmc1992.reset(self.host_rate);
+        self.next_malloc_addr = GEMDOS_MALLOC_START;
+        self.reset_triggered = false;
+        self.cpu_cycles = 0;
+        // Sync YM2149 sample timing with CPU cycle counter
+        self.ym2149.sync_sample_cycle(0);
+        // Initialize cycle-accurate MFP timers
+        self.mfp.sync_cpu_cycle(0);
+
+        // Setup RTE and RESET instructions in low memory
+        self.write_word(RTE_INSTRUCTION_ADDR, 0x4E73); // RTE
+        self.write_word(RESET_INSTRUCTION_ADDR, 0x4E70); // RESET
+
+        // Default unhandled vectors to a safe RTE stub
+        for vector in 24..32 {
+            self.write_long((vector * 4) as u32, RTE_INSTRUCTION_ADDR);
+        }
+        for vector in 32..48 {
+            self.write_long((vector * 4) as u32, RTE_INSTRUCTION_ADDR);
+        }
+        // A-line / F-line illegal instructions
+        self.write_long(0x28, RTE_INSTRUCTION_ADDR);
+        self.write_long(0x2C, RTE_INSTRUCTION_ADDR);
+
+        // Default timer C handler to RTE
+        self.write_long(0x114, RTE_INSTRUCTION_ADDR);
+
+        // Setup cookie jar for MaxyMizer player
+        self.write_long(0x900, 0x5F534E44); // '_SND'
+        self.write_long(0x904, 0x03);
+        self.write_long(0x908, 0x5F4D4348); // '_MCH'
+        self.write_long(0x90C, 0x00010000); // STE
+        self.write_long(0x910, 0);
+        self.write_long(0x5A0, 0x900);
+    }
+
+    fn read_byte(&mut self, addr: u32) -> u8 {
+        let addr = addr & 0x00FF_FFFF;
+
+        if addr < RAM_SIZE as u32 {
+            return self.ram[addr as usize];
+        }
+
+        // YM2149 PSG read
+        if (YM2149_START..YM2149_END).contains(&addr) {
+            return self.ym2149.read_port((addr & 0xff) as u8);
+        }
+
+        // STE DAC read (excluding Microwire registers)
+        if (STE_DAC_START..STE_DAC_END).contains(&addr) {
+            return self.ste_dac.read8((addr - STE_DAC_START) as u8);
+        }
+
+        // LMC1992 Microwire registers
+        if (LMC1992_START..LMC1992_END).contains(&addr) {
+            return self.lmc1992.read8((addr - STE_DAC_START) as u8);
+        }
+
+        // MFP 68901
+        if (MFP_START..MFP_END).contains(&addr) {
+            // Set CPU cycle for cycle-accurate timer counter reads
+            self.mfp.set_cpu_cycle(self.cpu_cycles);
+            return self.mfp.read8((addr - MFP_START) as u8);
+        }
+
+        // Video resolution (simulate low res)
+        if addr == 0xFF8260 {
+            return 0;
+        }
+
+        // Video sync (simulate PAL 50Hz)
+        if addr == 0xFF820A {
+            return 2;
+        }
+
+        0xFF
+    }
+
+    fn write_byte(&mut self, addr: u32, value: u8) {
+        let addr = addr & 0x00FF_FFFF;
+
+        if addr < RAM_SIZE as u32 {
+            self.ram[addr as usize] = value;
+            return;
+        }
+
+        // YM2149 PSG write (cycle-accurate timing)
+        if (YM2149_START..YM2149_END).contains(&addr) {
+            self.ym2149.set_cpu_cycle(self.cpu_cycles);
+            self.ym2149.write_port((addr & 0xfe) as u8, value);
+            return;
+        }
+
+        // STE DAC write (excluding Microwire registers)
+        if (STE_DAC_START..STE_DAC_END).contains(&addr) {
+            self.ste_dac.write8((addr - STE_DAC_START) as u8, value);
+            return;
+        }
+
+        // LMC1992 Microwire registers
+        if (LMC1992_START..LMC1992_END).contains(&addr) {
+            self.lmc1992.write8((addr - STE_DAC_START) as u8, value);
+            return;
+        }
+
+        // MFP 68901
+        if (MFP_START..MFP_WRITE_END).contains(&addr) {
+            self.mfp.write8((addr - MFP_START) as u8, value);
+        }
+    }
+
+    pub(crate) fn read_word(&mut self, addr: u32) -> u16 {
+        let addr = addr & 0x00FF_FFFF;
+
+        // MFP word read
+        if (MFP_START..MFP_END).contains(&addr) {
+            // Set CPU cycle for cycle-accurate timer counter reads
+            self.mfp.set_cpu_cycle(self.cpu_cycles);
+            return self.mfp.read16((addr - MFP_START) as u8);
+        }
+
+        // STE DAC word read (excluding Microwire registers)
+        if (STE_DAC_START..STE_DAC_END).contains(&addr) && (addr & 1) == 0 {
+            return self.ste_dac.read16((addr - STE_DAC_START) as u8);
+        }
+
+        // LMC1992 Microwire word read
+        if (LMC1992_START..LMC1992_END).contains(&addr) && (addr & 1) == 0 {
+            return self.lmc1992.read16((addr - STE_DAC_START) as u8);
+        }
+
+        // YM2149
+        if (YM2149_START..YM2149_END).contains(&addr) {
+            return (self.ym2149.read_port((addr & 0xfe) as u8) as u16) << 8;
+        }
+
+        // Standard word read from two bytes
+        ((self.read_byte(addr) as u16) << 8) | (self.read_byte(addr + 1) as u16)
+    }
+
+    pub(crate) fn write_word(&mut self, addr: u32, value: u16) {
+        let addr = addr & 0x00FF_FFFF;
+
+        // YM2149 PSG word write (cycle-accurate timing)
+        if (YM2149_START..YM2149_END).contains(&addr) {
+            self.ym2149.set_cpu_cycle(self.cpu_cycles);
+            self.ym2149.write_port((addr & 0xfe) as u8, (value >> 8) as u8);
+            return;
+        }
+
+        // STE DAC word write (excluding Microwire registers)
+        if (STE_DAC_START..STE_DAC_END).contains(&addr) {
+            self.ste_dac.write16((addr - STE_DAC_START) as u8, value);
+            return;
+        }
+
+        // LMC1992 Microwire word write
+        if (LMC1992_START..LMC1992_END).contains(&addr) {
+            self.lmc1992.write16((addr - STE_DAC_START) as u8, value);
+            return;
+        }
+
+        // MFP 68901 word write
+        if (MFP_START..MFP_WRITE_END).contains(&addr) {
+            self.mfp.write16((addr - MFP_START) as u8, value);
+            return;
+        }
+
+        // Standard word write to RAM
+        if addr < (RAM_SIZE as u32) - 1 {
+            self.ram[addr as usize] = (value >> 8) as u8;
+            self.ram[(addr + 1) as usize] = value as u8;
+        }
+    }
+
+    pub(crate) fn read_long(&mut self, addr: u32) -> u32 {
+        ((self.read_word(addr) as u32) << 16) | (self.read_word(addr + 2) as u32)
+    }
+
+    pub(crate) fn write_long(&mut self, addr: u32, value: u32) {
+        self.write_word(addr, (value >> 16) as u16);
+        self.write_word(addr + 2, value as u16);
+    }
+}
+
+// Implement our CpuMemory trait for AtariMemory
+impl CpuMemory for AtariMemory {
+    fn get_byte(&mut self, addr: u32) -> u8 {
+        self.read_byte(addr)
+    }
+
+    fn get_word(&mut self, addr: u32) -> u16 {
+        self.read_word(addr)
+    }
+
+    fn set_byte(&mut self, addr: u32, value: u8) {
+        self.write_byte(addr, value);
+    }
+
+    fn set_word(&mut self, addr: u32, value: u16) {
+        self.write_word(addr, value);
+    }
+
+    fn reset_instruction(&mut self) {
+        self.reset_triggered = true;
+    }
+}
+
+/// Atari ST machine emulation for SNDH playback.
+pub struct AtariMachine {
+    /// 68000 CPU (backend selected via features)
+    cpu: DefaultCpu,
+    /// Memory and peripherals
+    memory: AtariMemory,
+    /// Current interrupt nesting depth (0 = not in interrupt)
+    interrupt_nesting_depth: u8,
+    /// Priority of the currently executing interrupt (if any)
+    current_interrupt_priority: u8,
+    /// Incremental GEMDOS malloc pointer
+    next_gemdos_malloc: u32,
+    /// Enable cycle-accurate timer interrupts (disable during seek for performance)
+    cycle_accurate_timers: bool,
+}
+
+impl AtariMachine {
+    /// Create a new Atari ST machine.
+    pub fn new(sample_rate: u32) -> Self {
+        let mut machine = Self {
+            cpu: DefaultCpu::new(),
+            memory: AtariMemory::new(sample_rate),
+            interrupt_nesting_depth: 0,
+            current_interrupt_priority: 0,
+            next_gemdos_malloc: GEMDOS_MALLOC_START,
+            // MFP cycle-accurate timers enabled (seek-compatible implementation)
+            cycle_accurate_timers: true,
+        };
+        machine.reset();
+        machine
+    }
+
+    /// Reset the machine to initial state.
+    pub fn reset(&mut self) {
+        self.memory.reset();
+        self.cpu = DefaultCpu::new();
+        self.interrupt_nesting_depth = 0;
+        self.current_interrupt_priority = 0;
+        self.next_gemdos_malloc = GEMDOS_MALLOC_START;
+    }
+
+    /// Upload data to RAM.
+    pub fn upload(&mut self, data: &[u8], addr: u32) -> Result<()> {
+        let addr = addr as usize;
+        if addr + data.len() > RAM_SIZE {
+            return Err(SndhError::MemoryError {
+                address: addr as u32,
+                msg: format!("Upload would exceed RAM size ({})", data.len()),
+            });
+        }
+        self.memory.ram[addr..addr + data.len()].copy_from_slice(data);
+        Ok(())
+    }
+
+    /// Get the SNDH upload address.
+    pub fn sndh_upload_addr(&self) -> u32 {
+        SNDH_UPLOAD_ADDR
+    }
+
+    /// Call a subroutine (JSR) with D0 parameter.
+    pub fn jsr(&mut self, addr: u32, d0: u32) -> Result<bool> {
+        self.configure_return_by_rts();
+        self.cpu.set_d(0, d0);
+        self.jmp_binary(addr, INIT_TIMEOUT_FRAMES)
+    }
+
+    /// Call a subroutine (JSR) with D0 parameter and limited cycles.
+    pub fn jsr_limited(&mut self, addr: u32, d0: u32, max_cycles: usize) -> Result<bool> {
+        self.configure_return_by_rts();
+        self.cpu.set_d(0, d0);
+
+        self.memory.write_long(0x14, RTE_INSTRUCTION_ADDR);
+        self.memory.write_long(4, addr);
+
+        self.cpu.set_pc(addr);
+        self.cpu.set_a(7, self.memory.read_long(0));
+        self.cpu.set_stopped(false);
+        self.memory.reset_triggered = false;
+
+        let mut executed = 0;
+        while executed < max_cycles && !self.memory.reset_triggered && !self.cpu.is_stopped() {
+            // Update memory's cycle counter for cycle-accurate YM2149 writes
+            self.memory.cpu_cycles = self.cpu.total_cycles();
+            executed += self.cpu.step(&mut self.memory);
+
+            // Note: jsr_limited is used for seek/fast-forward, so we DON'T check
+            // cycle-accurate timers here. Timer interrupts are handled by tick_timers()
+            // which is called via compute_sample_stereo() after each frame during seek.
+        }
+
+        Ok(self.memory.reset_triggered)
+    }
+
+    /// Tick all MFP timers and dispatch their interrupts (legacy sample-based mode).
+    fn tick_timers(&mut self) {
+        let fired = self.memory.mfp.tick();
+        for (timer_idx, active) in fired.into_iter().enumerate() {
+            if !active {
+                continue;
+            }
+            self.dispatch_timer_interrupt(TIMER_ID_MAP[timer_idx]);
+        }
+    }
+
+    /// Dispatch a timer interrupt with nested interrupt support.
+    ///
+    /// Nested interrupts are allowed if:
+    /// - We're not at max nesting depth
+    /// - The new interrupt has higher MFP priority than the current one
+    fn dispatch_timer_interrupt(&mut self, timer_id: TimerId) {
+        let timer_idx = timer_id as usize;
+        let new_priority = MFP_PRIORITY[timer_idx];
+        let vector_addr = IVECTOR[timer_idx];
+        let pc = self.memory.read_long(vector_addr);
+        let pc24 = pc & 0x00FF_FFFF;
+
+        if pc == 0 || pc == RTE_INSTRUCTION_ADDR || (pc24 as usize) >= RAM_SIZE {
+            return;
+        }
+
+        // Check if we can dispatch this interrupt
+        if self.interrupt_nesting_depth > 0 {
+            // Already in an interrupt - check if nesting is allowed
+            if self.interrupt_nesting_depth >= MAX_INTERRUPT_NESTING {
+                // Max nesting reached - leave pending for later
+                return;
+            }
+            if new_priority <= self.current_interrupt_priority {
+                // Lower or equal priority - leave pending for later
+                return;
+            }
+            // Higher priority - allow nesting
+        }
+
+        // Save previous priority and increment nesting
+        let saved_priority = self.current_interrupt_priority;
+        self.current_interrupt_priority = new_priority;
+        self.interrupt_nesting_depth += 1;
+
+        // Add interrupt exception processing cycles (44 cycles per MC68000 manual)
+        self.cpu.add_cycles(CYCLES_INTERRUPT);
+
+        // Acknowledge interrupt (sets in-service, clears pending)
+        self.memory.mfp.acknowledge_timer(timer_id);
+
+        self.configure_return_by_rte();
+        self.memory.ym2149.inside_timer_irq(true);
+        let _ = self.jmp_binary_no_timer_check(pc, 1);
+        self.memory.ym2149.inside_timer_irq(false);
+
+        // End of interrupt (clears in-service for automatic EOI mode)
+        self.memory.mfp.end_of_interrupt_timer(timer_id);
+
+        // Restore previous state
+        self.interrupt_nesting_depth -= 1;
+        self.current_interrupt_priority = saved_priority;
+    }
+
+    fn xbios_timer_set(&mut self, config: XbiosTimerConfig) {
+        let back = self.memory.mfp.read8(config.ctrl_port) & config.mask;
+        self.memory.mfp.write8(config.ctrl_port, back);
+        self.memory.mfp.write8(config.data_port, config.data_value);
+        self.memory
+            .mfp
+            .write8(config.ctrl_port, back | config.ctrl_value);
+        // Enable timer
+        self.memory.mfp.write8(
+            config.enable_port,
+            self.memory.mfp.read8(config.enable_port) | (1 << config.bit),
+        );
+        self.memory.mfp.write8(
+            config.enable_port + 12,
+            self.memory.mfp.read8(config.enable_port + 12) | (1 << config.bit),
+        );
+        // Update cycle-accurate timer scheduling
+        self.memory.mfp.sync_cpu_cycle(self.cpu.total_cycles());
+    }
+
+    fn handle_gemdos(&mut self, func: u16, sp: u32) {
+        match func {
+            0x01 => {
+                // Supervisor
+                let sr_raw: u16 = self.cpu.sr();
+                self.cpu.set_d(0, sr_raw as u32);
+            }
+            0x48 => {
+                // Malloc
+                let size = self.memory.read_long(sp.wrapping_add(2));
+                let addr = self.next_gemdos_malloc;
+                self.next_gemdos_malloc =
+                    self.next_gemdos_malloc.saturating_add(size + 1) & (!1u32);
+                if (self.next_gemdos_malloc as usize) > RAM_SIZE {
+                    self.cpu.set_d(0, 0);
+                } else {
+                    self.cpu.set_d(0, addr);
+                }
+            }
+            0x30 => {
+                // System version
+                self.cpu.set_d(0, 0x0000);
+            }
+            _ => {
+                self.cpu.set_d(0, 0);
+            }
+        }
+    }
+
+    fn handle_xbios(&mut self, func: u16, sp: u32) {
+        match func {
+            31 => {
+                // Xbtimer
+                let timer = self.memory.read_word(sp.wrapping_add(2));
+                let ctrl_word = self.memory.read_word(sp.wrapping_add(4));
+                let data_word = self.memory.read_word(sp.wrapping_add(6));
+                let vector = self.memory.read_long(sp.wrapping_add(8)) & 0x00FF_FFFF;
+
+                if (timer as usize) < IVECTOR.len() - 1 {
+                    if (vector as usize) < RAM_SIZE {
+                        self.memory.write_long(IVECTOR[timer as usize], vector);
+                    } else {
+                        self.memory
+                            .write_long(IVECTOR[timer as usize], RTE_INSTRUCTION_ADDR);
+                    }
+                    match timer {
+                        0 => self.xbios_timer_set(XbiosTimerConfig {
+                            ctrl_port: 0x19,
+                            data_port: 0x1F,
+                            enable_port: 0x07,
+                            bit: 5,
+                            mask: 0x00,
+                            ctrl_value: ctrl_word as u8,
+                            data_value: data_word as u8,
+                        }),
+                        1 => self.xbios_timer_set(XbiosTimerConfig {
+                            ctrl_port: 0x1B,
+                            data_port: 0x21,
+                            enable_port: 0x07,
+                            bit: 0,
+                            mask: 0x00,
+                            ctrl_value: ctrl_word as u8,
+                            data_value: data_word as u8,
+                        }),
+                        2 => self.xbios_timer_set(XbiosTimerConfig {
+                            ctrl_port: 0x1D,
+                            data_port: 0x23,
+                            enable_port: 0x09,
+                            bit: 5,
+                            mask: 0x0F,
+                            ctrl_value: ((ctrl_word & 0x0F) << 4) as u8,
+                            data_value: data_word as u8,
+                        }),
+                        3 => self.xbios_timer_set(XbiosTimerConfig {
+                            ctrl_port: 0x1D,
+                            data_port: 0x25,
+                            enable_port: 0x09,
+                            bit: 4,
+                            mask: 0xF0,
+                            ctrl_value: (ctrl_word & 0x0F) as u8,
+                            data_value: data_word as u8,
+                        }),
+                        _ => {}
+                    }
+                }
+            }
+            38 => {
+                // Supexec
+                let callback = self.memory.read_long(sp.wrapping_add(2));
+                let mut a7 = self.cpu.a(7);
+                a7 = a7.wrapping_sub(4);
+                self.memory.write_long(a7, self.cpu.pc().wrapping_add(2));
+                self.cpu.set_a(7, a7);
+                self.cpu.set_pc(callback & 0x00FF_FFFF);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_trap(&mut self, vector: u8) -> bool {
+        let sp = self.cpu.a(7);
+        let func = self.memory.read_word(sp);
+
+        match vector {
+            1 => {
+                self.handle_gemdos(func, sp);
+                self.cpu.set_pc(self.cpu.pc().wrapping_add(2));
+                true
+            }
+            14 => {
+                let old_pc = self.cpu.pc();
+                self.handle_xbios(func, sp);
+                if self.cpu.pc() == old_pc {
+                    self.cpu.set_pc(self.cpu.pc().wrapping_add(2));
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Compute the next stereo audio sample.
+    /// Returns (left, right) samples.
+    pub fn compute_sample_stereo(&mut self) -> (i16, i16) {
+        // Get YM2149 sample (mono, duplicated to both channels)
+        // Only if LMC1992 mix is enabled
+        let ym_sample = if self.memory.lmc1992.should_mix_ym() {
+            self.memory.ym2149.compute_next_sample() as i32
+        } else {
+            // Still need to tick YM2149 for internal state
+            let _ = self.memory.ym2149.compute_next_sample();
+            0
+        };
+
+        // Get STE DAC stereo sample
+        let (ste_left, ste_right) = self
+            .memory
+            .ste_dac
+            .compute_sample_stereo(&self.memory.ram, &mut self.memory.mfp);
+
+        // Mix YM2149 (mono) with STE DAC (stereo)
+        let mixed_left = (ym_sample + ste_left as i32).clamp(-32768, 32767) as i16;
+        let mixed_right = (ym_sample + ste_right as i32).clamp(-32768, 32767) as i16;
+
+        // Process through LMC1992 (bass/treble EQ + volume control)
+        let (lmc_left, lmc_right) = self.memory.lmc1992.process_stereo(mixed_left, mixed_right);
+
+        // Apply master gain
+        let out_left = ((lmc_left as f32 * MASTER_GAIN) as i32).clamp(-32768, 32767) as i16;
+        let out_right = ((lmc_right as f32 * MASTER_GAIN) as i32).clamp(-32768, 32767) as i16;
+
+        // Tick timers after mixing
+        self.tick_timers();
+
+        (out_left, out_right)
+    }
+
+    /// Synchronize timing systems after a seek or time discontinuity.
+    ///
+    /// Call this after fast-forwarding to ensure MFP timers and YM2149
+    /// are aligned with the current CPU cycle count.
+    pub fn sync_timing(&mut self) {
+        let cpu_cycle = self.cpu.total_cycles();
+
+        // Reset MFP timer states (clears pending/in-service, resets counters)
+        self.memory.mfp.sync_cpu_cycle(cpu_cycle);
+
+        // Clear interrupt state in case we were mid-interrupt during seek
+        self.interrupt_nesting_depth = 0;
+        self.current_interrupt_priority = 0;
+
+        // Flush any pending YM2149 writes before syncing cycle
+        self.memory.ym2149.flush_pending_writes();
+        self.memory.ym2149.sync_sample_cycle(cpu_cycle);
+
+        // Sync STE DAC bus contention tracking
+        self.memory.ste_dac.sync_contention(cpu_cycle);
+
+        self.memory.cpu_cycles = cpu_cycle;
+    }
+
+    /// Get reference to YM2149.
+    pub fn ym2149(&self) -> &Ym2149 {
+        &self.memory.ym2149
+    }
+
+    /// Get mutable reference to YM2149 (for channel muting).
+    pub fn ym2149_mut(&mut self) -> &mut Ym2149 {
+        &mut self.memory.ym2149
+    }
+
+    /// Check if YM2149 output is being mixed (via LMC1992 setting).
+    ///
+    /// Returns false when the SNDH driver has set the mixer to DMA-only mode.
+    pub fn is_ym_mixed(&self) -> bool {
+        self.memory.lmc1992.should_mix_ym()
+    }
+
+    /// Mute or unmute the STE DAC left channel.
+    pub fn set_dac_mute_left(&mut self, mute: bool) {
+        self.memory.ste_dac.set_mute_left(mute);
+    }
+
+    /// Mute or unmute the STE DAC right channel.
+    pub fn set_dac_mute_right(&mut self, mute: bool) {
+        self.memory.ste_dac.set_mute_right(mute);
+    }
+
+    /// Check if DAC left channel is muted.
+    pub fn is_dac_left_muted(&self) -> bool {
+        self.memory.ste_dac.is_left_muted()
+    }
+
+    /// Check if DAC right channel is muted.
+    pub fn is_dac_right_muted(&self) -> bool {
+        self.memory.ste_dac.is_right_muted()
+    }
+
+    /// Get current DAC levels for visualization (normalized 0.0 to 1.0).
+    pub fn get_dac_levels(&self) -> (f32, f32) {
+        self.memory.ste_dac.get_levels()
+    }
+
+    /// Check if STE DAC has been used (DMA playback was activated).
+    ///
+    /// Runtime detection of STE features, independent of FLAG tag.
+    pub fn was_ste_dac_used(&self) -> bool {
+        self.memory.ste_dac.was_used()
+    }
+
+    /// Get LMC1992 master volume in dB (-80 to 0).
+    pub fn lmc1992_master_volume_db(&self) -> i8 {
+        self.memory.lmc1992.master_volume_db()
+    }
+
+    /// Get LMC1992 left volume in dB (-40 to 0).
+    pub fn lmc1992_left_volume_db(&self) -> i8 {
+        self.memory.lmc1992.left_volume_db()
+    }
+
+    /// Get LMC1992 right volume in dB (-40 to 0).
+    pub fn lmc1992_right_volume_db(&self) -> i8 {
+        self.memory.lmc1992.right_volume_db()
+    }
+
+    /// Get LMC1992 bass in dB (-12 to +12).
+    pub fn lmc1992_bass_db(&self) -> i8 {
+        self.memory.lmc1992.bass_db()
+    }
+
+    /// Get LMC1992 treble in dB (-12 to +12).
+    pub fn lmc1992_treble_db(&self) -> i8 {
+        self.memory.lmc1992.treble_db()
+    }
+
+    /// Get LMC1992 master volume raw value (0-40).
+    pub fn lmc1992_master_volume_raw(&self) -> u8 {
+        self.memory.lmc1992.master_volume()
+    }
+
+    /// Get LMC1992 left volume raw value (0-20).
+    pub fn lmc1992_left_volume_raw(&self) -> u8 {
+        self.memory.lmc1992.left_volume()
+    }
+
+    /// Get LMC1992 right volume raw value (0-20).
+    pub fn lmc1992_right_volume_raw(&self) -> u8 {
+        self.memory.lmc1992.right_volume()
+    }
+
+    /// Get LMC1992 bass raw value (0-12).
+    pub fn lmc1992_bass_raw(&self) -> u8 {
+        self.memory.lmc1992.bass()
+    }
+
+    /// Get LMC1992 treble raw value (0-12).
+    pub fn lmc1992_treble_raw(&self) -> u8 {
+        self.memory.lmc1992.treble()
+    }
+
+    fn configure_return_by_rts(&mut self) {
+        self.memory
+            .write_long(RAM_SIZE as u32 - 4, RESET_INSTRUCTION_ADDR);
+        self.memory.write_long(0, RAM_SIZE as u32 - 4);
+    }
+
+    fn configure_return_by_rte(&mut self) {
+        self.memory
+            .write_long(RAM_SIZE as u32 - 4, RESET_INSTRUCTION_ADDR);
+        self.memory.write_word(RAM_SIZE as u32 - 6, 0x2300);
+        self.memory.write_long(0, RAM_SIZE as u32 - 6);
+    }
+
+    fn jmp_binary(&mut self, pc: u32, timeout_frames: u32) -> Result<bool> {
+        self.jmp_binary_internal(pc, timeout_frames, true)
+    }
+
+    /// Execute without checking for timer interrupts (used during IRQ handlers).
+    fn jmp_binary_no_timer_check(&mut self, pc: u32, timeout_frames: u32) -> Result<bool> {
+        self.jmp_binary_internal(pc, timeout_frames, false)
+    }
+
+    fn jmp_binary_internal(&mut self, pc: u32, timeout_frames: u32, check_timers: bool) -> Result<bool> {
+        self.memory.write_long(0x14, RTE_INSTRUCTION_ADDR);
+        self.memory.write_long(4, pc);
+
+        self.cpu.set_pc(pc);
+        self.cpu.set_a(7, self.memory.read_long(0));
+        self.cpu.set_stopped(false);
+        self.memory.reset_triggered = false;
+
+        let cycles_per_frame = 512 * 313;
+        let total_cycles = (timeout_frames as usize) * cycles_per_frame;
+        let mut executed = 0;
+
+        while executed < total_cycles && !self.memory.reset_triggered && !self.cpu.is_stopped() {
+            let current_pc = self.cpu.pc();
+            let pc24 = current_pc & 0x00FF_FFFF;
+
+            // Intercept TRAP #1/#14
+            let opcode = self.memory.read_word(pc24);
+            if opcode & 0xFFF0 == 0x4E40 {
+                let vector = (opcode & 0x000F) as u8;
+                if self.handle_trap(vector) {
+                    // Add TRAP exception processing cycles to CPU counter
+                    self.cpu.add_cycles(CYCLES_TRAP);
+                    executed += CYCLES_TRAP as usize;
+                    continue;
+                }
+            }
+
+            // If code jumps into TOS ROM space, treat it as a stubbed RTS.
+            if (pc24 >= 0x00E0_0000) && (pc24 as usize) < 0x0100_0000 {
+                self.memory.reset_triggered = true;
+                break;
+            }
+
+            // Update memory's cycle counter for cycle-accurate YM2149 writes
+            self.memory.cpu_cycles = self.cpu.total_cycles();
+            let step_cycles = self.cpu.step(&mut self.memory);
+            executed += step_cycles;
+
+            // Add DMA bus contention cycles (STE DMA steals bus cycles from CPU)
+            let contention = self.memory.ste_dac.get_bus_contention_cycles(self.cpu.total_cycles());
+            if contention > 0 {
+                self.cpu.add_cycles(contention);
+                executed += contention as usize;
+            }
+
+            // Check for cycle-accurate timer interrupts (if enabled).
+            // Nested interrupt logic is handled in dispatch_timer_interrupt.
+            if check_timers && self.cycle_accurate_timers {
+                let cpu_cycle = self.cpu.total_cycles();
+                if let Some(next_fire) = self.memory.mfp.next_timer_fire_cycle() {
+                    // Add MFP-internal latency before dispatch.
+                    // The CPU-side latency (instruction completion) is implicit -
+                    // we only check after each instruction, so longer instructions
+                    // naturally delay interrupt recognition.
+                    if cpu_cycle >= next_fire + MFP_INTERRUPT_LATENCY_CYCLES {
+                        if let Some(timer_id) = self.memory.mfp.check_timers_at_cycle(cpu_cycle) {
+                            self.dispatch_timer_interrupt(timer_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        if !self.memory.reset_triggered && !self.cpu.is_stopped() {
+            return Err(SndhError::InitTimeout {
+                frames: timeout_frames,
+            });
+        }
+
+        Ok(self.memory.reset_triggered)
+    }
+}

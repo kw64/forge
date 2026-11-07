@@ -1,0 +1,13 @@
+MediaForge - composants tiers (v0.4.0)
+
+FFmpeg / FFprobe (https://ffmpeg.org) - processus externes pilotés par MediaForge.
+  Les archives distribuées embarquent un build GPL (BtbN/FFmpeg-Builds) : ces archives sont donc
+  redistribuées sous GPL. Code source : https://ffmpeg.org/download.html et https://github.com/BtbN/FFmpeg-Builds
+
+libmpv (https://mpv.io) - moteur de lecture de MediaForge Player, chargé dynamiquement à l'exécution.
+  Seule une build LGPL v2.1+ de libmpv doit être redistribuée avec MediaForge (build « lgpl » de
+  https://github.com/shinchiro/mpv-winbuild-cmake). Code source : https://github.com/mpv-player/mpv
+  Dépendances embarquées dans libmpv (FFmpeg, libplacebo, libass, etc.) : voir leurs licences respectives.
+
+Bibliothèques Rust : eframe/egui (MIT/Apache-2.0), rfd, serde, clap, anyhow, thiserror, dirs, libloading,
+arboard, image (licences permissives - voir `cargo tree` / crates.io).

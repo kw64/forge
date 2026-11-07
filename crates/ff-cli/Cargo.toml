@@ -1,0 +1,20 @@
+[package]
+name = "ff-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mediaforge-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+ff-core.workspace = true
+ff-engine.workspace = true
+ff-probe.workspace = true
+ff-profiles.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

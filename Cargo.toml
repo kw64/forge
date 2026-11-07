@@ -1,0 +1,34 @@
+# MediaForge workspace - v0.4.0 (v1 + lecteur universel)
+[workspace]
+resolver = "2"
+members = ["crates/ff-kit", "crates/ff-core", "crates/ff-probe", "crates/ff-engine", "crates/ff-profiles", "crates/ff-cli", "crates/ff-ui", "crates/ff-mpv", "crates/ff-player", "crates/ff-forge", "crates/ff-image", "crates/ff-online", "crates/ff-auto", "crates/autoforge", "crates/ff-chip"]
+
+[workspace.package]
+version = "0.15.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+dirs = "7"
+eframe = "0.37"
+rfd = "0.17"
+ff-core = { path = "crates/ff-core" }
+ff-probe = { path = "crates/ff-probe" }
+ff-engine = { path = "crates/ff-engine" }
+ff-profiles = { path = "crates/ff-profiles" }
+ff-mpv = { path = "crates/ff-mpv" }
+ff-kit = { path = "crates/ff-kit" }
+ff-image = { path = "crates/ff-image" }
+ff-online = { path = "crates/ff-online" }
+ff-auto = { path = "crates/ff-auto" }
+ff-chip = { path = "crates/ff-chip" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

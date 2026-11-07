@@ -1,0 +1,11 @@
+[package]
+name = "ff-online"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MediaForge — listes de vidéos en ligne (YouTube non répertoriées, etc.) via yt-dlp"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ff-profiles.workspace = true

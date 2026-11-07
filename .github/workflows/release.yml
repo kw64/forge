@@ -1,0 +1,64 @@
+# MediaForge - build des livrables (zip portable Windows + AppImage Linux). v0.2.0
+# FFmpeg (build GPL de BtbN) est embarqué : l'application distribuée est donc soumise à la GPL pour ces archives.
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  FFMPEG_URL_LINUX: https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz
+  FFMPEG_URL_WIN: https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip
+
+jobs:
+  appimage:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      - run: cargo build --release -p ff-ui -p ff-cli
+      - name: Assemblage de l'AppDir
+        run: |
+          mkdir -p AppDir/usr/bin ff
+          curl -sL "$FFMPEG_URL_LINUX" -o ffmpeg.tar.xz
+          tar -xJf ffmpeg.tar.xz -C ff --strip-components=2 --wildcards '*/bin/ffmpeg' '*/bin/ffprobe'
+          cp target/release/mediaforge target/release/mediaforge-cli ff/ffmpeg ff/ffprobe AppDir/usr/bin/
+          cp packaging/linux/mediaforge.desktop AppDir/
+          cp assets/mediaforge.png AppDir/mediaforge.png
+          ln -s usr/bin/mediaforge AppDir/AppRun
+      - name: Construction de l'AppImage
+        run: |
+          curl -sL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool AppDir "MediaForge-${VERSION}-x86_64.AppImage"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MediaForge-AppImage
+          path: MediaForge-*.AppImage
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      - run: cargo build --release -p ff-ui -p ff-cli
+      - name: Assemblage du zip portable
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force MediaForge/ffmpeg | Out-Null
+          Invoke-WebRequest $env:FFMPEG_URL_WIN -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffx
+          Copy-Item ffx/*/bin/ffmpeg.exe, ffx/*/bin/ffprobe.exe MediaForge/ffmpeg/
+          Copy-Item target/release/mediaforge.exe, target/release/mediaforge-cli.exe MediaForge/
+          # Le fichier témoin active le mode portable : réglages et journal dans ./data
+          New-Item MediaForge/mediaforge.portable -ItemType File | Out-Null
+          Compress-Archive -Path MediaForge -DestinationPath MediaForge-windows-portable.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MediaForge-Windows-portable
+          path: MediaForge-windows-portable.zip

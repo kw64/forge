@@ -1,0 +1,30 @@
+[package]
+name = "ff-player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mediaforge-player"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+dirs.workspace = true
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "clipboard", "links", "wayland", "x11", "accesskit"] }
+rfd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ff-core.workspace = true
+ff-mpv.workspace = true
+ff-profiles.workspace = true
+ff-online.workspace = true
+ff-kit.workspace = true
+ff-chip.workspace = true
+arboard = { version = "3", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"] }
+hayro = "0.8.0"
+psd = "0.3.5"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

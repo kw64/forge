@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=MediaForge Player
+Comment=Lecteur audio, vidéo et images
+Exec=mediaforge-player %F
+Icon=mediaforge
+Terminal=false
+Categories=AudioVideo;Player;Graphics;Viewer;
+MimeType=video/mp4;video/x-matroska;video/webm;video/x-msvideo;video/quicktime;audio/mpeg;audio/flac;audio/ogg;audio/x-wav;audio/mp4;image/jpeg;image/png;image/gif;image/webp;image/bmp;image/tiff;image/avif;

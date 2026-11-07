@@ -1,0 +1,8 @@
+[package]
+name = "ff-kit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+egui = { version = "0.37", default-features = false }

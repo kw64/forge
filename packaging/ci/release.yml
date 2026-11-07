@@ -1,0 +1,88 @@
+# À copier vers .github/workflows/release.yml pour activer la CI GitHub.
+# MediaForge - build des livrables (zip portable Windows + AppImage Linux). v0.4.0
+# FFmpeg (build GPL de BtbN) est embarqué : les archives distribuées sont donc soumises à la GPL.
+# libmpv (lecteur) : build LGPL de shinchiro, chargée dynamiquement (libmpv-2.dll à côté de l'exécutable).
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  FFMPEG_URL_LINUX: https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz
+  FFMPEG_URL_WIN: https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip
+
+jobs:
+  appimage:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Dépendances de build et d'exécution des tests
+        run: sudo apt-get update && sudo apt-get install -y libmpv2 libgl1 libxkbcommon-x11-0 libxcb-xfixes0-dev
+      - run: cargo test --workspace --exclude ff-mpv
+      - run: cargo build --release -p ff-ui -p ff-cli -p ff-player
+      - name: Assemblage de l'AppDir
+        run: |
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications ff
+          curl -sL "$FFMPEG_URL_LINUX" -o ffmpeg.tar.xz
+          tar -xJf ffmpeg.tar.xz -C ff --strip-components=2 --wildcards '*/bin/ffmpeg' '*/bin/ffprobe'
+          cp target/release/mediaforge target/release/mediaforge-cli target/release/mediaforge-player target/release/fileforge ff/ffmpeg ff/ffprobe AppDir/usr/bin/
+          cp packaging/linux/mediaforge.desktop AppDir/
+          cp packaging/linux/mediaforge-player.desktop AppDir/usr/share/applications/
+          cp packaging/THIRD_PARTY_NOTICES.txt AppDir/usr/
+          cp assets/mediaforge.png AppDir/mediaforge.png
+          # AppRun : « --player » (ou un nom d'appel contenant « player ») lance le lecteur ; sinon le convertisseur.
+          printf '%s\n' '#!/bin/sh' \
+            'HERE="$(dirname "$(readlink -f "$0")")"' \
+            'case "$(basename "${ARGV0:-$0}")" in *player*) exec "$HERE/usr/bin/mediaforge-player" "$@";; esac' \
+            'if [ "$1" = "--player" ]; then shift; exec "$HERE/usr/bin/mediaforge-player" "$@"; fi' \
+            'exec "$HERE/usr/bin/mediaforge" "$@"' > AppDir/AppRun
+          chmod +x AppDir/AppRun
+      - name: Construction de l'AppImage
+        run: |
+          curl -sL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool AppDir "MediaForge-${VERSION}-x86_64.AppImage"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MediaForge-AppImage
+          path: MediaForge-*.AppImage
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Récupération de libmpv (build LGPL)
+        shell: pwsh
+        run: |
+          $rel = Invoke-RestMethod -Headers @{ Authorization = "Bearer ${{ secrets.GITHUB_TOKEN }}" } https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest
+          $asset = $rel.assets | Where-Object { $_.name -match '^mpv-dev-lgpl-x86_64-(?!v3)' -and $_.name -like '*.7z' } | Select-Object -First 1
+          if (-not $asset) { throw "Aucune archive mpv-dev-lgpl-x86_64 dans la dernière version de shinchiro/mpv-winbuild-cmake" }
+          Invoke-WebRequest $asset.browser_download_url -OutFile mpv-dev.7z
+          7z x mpv-dev.7z -ompv-dev -y | Out-Null
+          $dll = Get-ChildItem mpv-dev -Recurse -Filter libmpv-2.dll | Select-Object -First 1
+          if (-not $dll) { throw "libmpv-2.dll introuvable dans $($asset.name)" }
+          Copy-Item $dll.FullName libmpv-2.dll
+      - run: cargo test --workspace --exclude ff-mpv
+      - run: cargo build --release -p ff-ui -p ff-cli -p ff-player
+      - name: Assemblage du zip portable
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force MediaForge/ffmpeg | Out-Null
+          Invoke-WebRequest $env:FFMPEG_URL_WIN -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffx
+          Copy-Item ffx/*/bin/ffmpeg.exe, ffx/*/bin/ffprobe.exe MediaForge/ffmpeg/
+          Copy-Item target/release/mediaforge.exe, target/release/mediaforge-cli.exe, target/release/mediaforge-player.exe, target/release/fileforge.exe, libmpv-2.dll MediaForge/
+          Copy-Item packaging/THIRD_PARTY_NOTICES.txt MediaForge/
+          # Le fichier témoin active le mode portable : réglages et journal dans ./data
+          New-Item MediaForge/mediaforge.portable -ItemType File | Out-Null
+          Compress-Archive -Path MediaForge -DestinationPath MediaForge-windows-portable.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MediaForge-Windows-portable
+          path: MediaForge-windows-portable.zip
